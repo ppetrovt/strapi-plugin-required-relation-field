@@ -1,14 +1,41 @@
-import type { Core } from '@strapi/strapi';
+import { Core, UID, Schema } from '@strapi/strapi';
 import { get, isEmpty, transform } from 'lodash';
 import { Event } from '@strapi/database/dist/lifecycles';
 import { BaseAttribute } from '@strapi/database/dist/types';
 import { errors } from '@strapi/utils';
 
 type Attribute = BaseAttribute & { fieldName: string };
+type RelationWithTarget = Schema.Attribute.Relation & {
+  target: UID.ContentType;
+};
 
-// This function will be called when the Strapi server is bootstrapped
 const bootstrap = ({ strapi }: { strapi: Core.Strapi }) => {
   strapi.db.lifecycles.subscribe({
+    async beforeDelete(event) {
+      const { model, params } = event;
+      const idToDelete = params.where?.id;
+      const targetUid = model.uid as UID.ContentType;
+      const linkedTypes = getContentTypesReferencing(targetUid);
+
+      if (linkedTypes.length === 0) {
+        return;
+      }
+
+      for (const ref of linkedTypes) {
+        const count = await strapi.db.query(ref.uid).count({
+          where: {
+            [ref.attribute]: idToDelete,
+          },
+        });
+
+        if (count > 0) {
+          throw new errors.ApplicationError(
+            `You cannot delete this ${targetUid} because it is referenced by required relation '${ref.attribute}' in '${ref.uid}'.`
+          );
+        }
+      }
+    },
+
     async beforeCreate(event) {
       await validateRelations(event, strapi);
     },
@@ -18,6 +45,38 @@ const bootstrap = ({ strapi }: { strapi: Core.Strapi }) => {
     },
   });
 };
+
+export function getContentTypesReferencing(targetUid: UID.ContentType) {
+  const result: {
+    uid: UID.ContentType;
+    attribute: string;
+    target: UID.ContentType;
+  }[] = [];
+
+  for (const [uid, schema] of Object.entries(strapi.contentTypes)) {
+    for (const [attribute, metadata] of Object.entries(schema.attributes || {})) {
+      const typedMetadata = metadata as RelationWithTarget;
+
+      if (
+        !typedMetadata ||
+        attribute === 'localizations' ||
+        typedMetadata.type !== 'relation' ||
+        typedMetadata.target !== targetUid ||
+        typedMetadata.required !== true
+      ) {
+        continue;
+      }
+
+      result.push({
+        uid: uid as UID.ContentType,
+        attribute,
+        target: typedMetadata.target,
+      });
+    }
+  }
+
+  return result;
+}
 
 // This function will validate if the required relations are present
 async function validateRelations(event: Event, strapi: Core.Strapi) {
